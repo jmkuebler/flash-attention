@@ -126,6 +126,7 @@ public:
         int block_m;
         int block_k;
         int bidb;
+        int split_group_idx;
     };
 
     struct SharedStorage : cute::aligned_struct<128> {
@@ -155,6 +156,14 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        // Split-group combine
+        int num_split_groups = 0;
+        int splits_per_group = 0;
+        float* const oaccum_scratch_ptr = nullptr;
+        float* const lseaccum_scratch_ptr = nullptr;
+        int64_t scratch_oaccum_group_stride = 0;
+        int64_t scratch_lseaccum_group_stride = 0;
+        int* const combine_semaphore = nullptr;
     };
 
     // Kernel entry point API
@@ -176,6 +185,14 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        // Split-group combine
+        int num_split_groups = 0;
+        int splits_per_group = 0;
+        float* const oaccum_scratch_ptr = nullptr;
+        float* const lseaccum_scratch_ptr = nullptr;
+        int64_t scratch_oaccum_group_stride = 0;
+        int64_t scratch_lseaccum_group_stride = 0;
+        int* const combine_semaphore = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -200,7 +217,14 @@ public:
             args.seqused,
             args.num_splits_dynamic_ptr,
             args.varlen_batch_idx_ptr,
-            args.semaphore_to_reset
+            args.semaphore_to_reset,
+            args.num_split_groups,
+            args.splits_per_group,
+            args.oaccum_scratch_ptr,
+            args.lseaccum_scratch_ptr,
+            args.scratch_oaccum_group_stride,
+            args.scratch_lseaccum_group_stride,
+            args.combine_semaphore
         };
     }
 
@@ -215,11 +239,17 @@ public:
         int const* cu_seqlens_q;
         int const* seqused_q;
         int const* prepare_seqlen_q_ptr;
+        int num_split_groups = 0;
     };
 
     struct StaticTileScheduler {
-        struct Params {};
-        static Params to_underlying_arguments(SchedulerArguments const& args) { return {}; }
+        struct Params {
+            int num_split_groups;
+            cutlass::FastDivmod batch_divmod;
+        };
+        static Params to_underlying_arguments(SchedulerArguments const& args) {
+            return {args.num_split_groups, cutlass::FastDivmod(args.b > 0 ? args.b : 1)};
+        }
 
         SharedStorage& shared_storage;
         CUTE_DEVICE StaticTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
@@ -227,14 +257,20 @@ public:
         static dim3 get_grid_shape(SchedulerArguments const& args) {
             unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
             unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
-            return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
+            unsigned int grid_z = static_cast<unsigned int>(args.b);
+            if (args.num_split_groups > 0) { grid_z *= args.num_split_groups; }
+            return {num_blocks_m, num_blocks_k, grid_z};
         }
 
         CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
             int block_m = blockIdx.x;
             int block_k = blockIdx.y;
             int bidb = blockIdx.z;
-            return {block_m, block_k, bidb};
+            int split_group_idx = 0;
+            if (params.num_split_groups > 0) {
+                split_group_idx = params.batch_divmod.divmod(bidb, blockIdx.z);
+            }
+            return {block_m, block_k, bidb, split_group_idx};
         }
     };
 
@@ -376,7 +412,7 @@ public:
                 //  just inlined `blockIdx.y` to suppress the warning
                 // int block_k = blockIdx.y;
                 // shared_storage.block_coord = {block_m, block_k, bidb};
-                BlockCoord block_coord{block_m, static_cast<int>(blockIdx.y), bidb};
+                BlockCoord block_coord{block_m, static_cast<int>(blockIdx.y), bidb, 0};
                 if (threadIdx.x == 0) { shared_storage.block_coord = block_coord; }
             }
 
@@ -389,7 +425,7 @@ public:
             int block_m = blockIdx.x;
             int block_k = blockIdx.y;
             int bidb = blockIdx.z;
-            return {block_m, block_k, bidb};
+            return {block_m, block_k, bidb, 0};
         }
 
         CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
@@ -453,6 +489,11 @@ public:
         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
         if (num_splits <= 1) { return; }
 
+        int const split_group_idx = block_coord.split_group_idx;
+        int const split_start = params.num_split_groups > 0 ? split_group_idx * params.splits_per_group : 0;
+        int const split_end = params.num_split_groups > 0 ? min(split_start + params.splits_per_group, num_splits) : num_splits;
+        int const group_num_splits = split_end - split_start;
+
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
 
         // Step 1: load LSE_partial from gmem -> smem
@@ -487,8 +528,8 @@ public:
                 for (int s = 0; s < size<1>(tLSEcLSE); ++s) {
                     int si = get<0>(tLSEcLSE(_0{}, s, _0{}));
                     // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("thread_idx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(tLSEsLSE(_0{}, s, m))), reinterpret_cast<int>(&(tLSEsLSE(_0{}, s, m))) / 4 % 32);}
-                    if (si < num_splits) {
-                        cute::copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si), tLSEsLSE(_, s, m));
+                    if (si < group_num_splits) {
+                        cute::copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si + split_start), tLSEsLSE(_, s, m));
                     } else {
                         cute::fill(tLSEsLSE(_, s, m), -INFINITY);
                     }
@@ -549,7 +590,7 @@ public:
                     for (int k = 0; k < size<2>(tOcO); ++k) {
                         int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
                         if (Is_even_K || tOpO(k)) {
-                            cute::copy(gmem_tiled_copy_O_partial, mOpartial_cur_copy(_, k_idx, split), tOsOpartial_cur(_, m, k));
+                            cute::copy(gmem_tiled_copy_O_partial, mOpartial_cur_copy(_, k_idx, split + split_start), tOsOpartial_cur(_, m, k));
                         }
                     }
                 }
@@ -557,7 +598,7 @@ public:
         };
 
         for (int s = 0; s < kStages - 1; ++s) {
-            if (s < num_splits) { load_O_partial(s, s); }
+            if (s < group_num_splits) { load_O_partial(s, s); }
             if constexpr (Has_cp_async) { cute::cp_async_fence(); }
         }
 
@@ -620,24 +661,48 @@ public:
             }
         }
 
-        // Step 5: store final LSE back to gmem
+        // Step 5: store LSE back to gmem (or scratch if split-group mode)
         if (k_block == 0) {
-            auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
-            Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
-            #pragma unroll
-            for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
-                if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
-                    int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
-                    int idx = m_block * kBlockM + mi;
-                    if (idx < max_idx) {
-                        int m_idx, bidh;
-                        if constexpr (!Varlen) {
-                            bidh = params.seqlen_divmod.divmod(m_idx, idx);
-                        } else {
-                            bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+            if (params.num_split_groups <= 0) {
+                // Original path: write final LSE
+                auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
+                Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+                #pragma unroll
+                for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
+                    if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {
+                        int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
+                        int idx = m_block * kBlockM + mi;
+                        if (idx < max_idx) {
+                            int m_idx, bidh;
+                            if constexpr (!Varlen) {
+                                bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                            } else {
+                                bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                            }
+                            mLSE(m_idx, bidh) = lse_sum(m);
                         }
-                        // printf("thread_idx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n", thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
-                        mLSE(m_idx, bidh) = lse_sum(m);
+                    }
+                }
+            } else {
+                // Split-group path: write group LSE to scratch
+                // scratch layout: (num_split_groups, seqlen, head, batch) with stride scratch_lseaccum_group_stride
+                float* scratch_lse_base = params.lseaccum_scratch_ptr + split_group_idx * params.scratch_lseaccum_group_stride;
+                auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
+                Tensor mLSEscratch = make_tensor(make_gmem_ptr(scratch_lse_base + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+                #pragma unroll
+                for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
+                    if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {
+                        int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
+                        int idx = m_block * kBlockM + mi;
+                        if (idx < max_idx) {
+                            int m_idx, bidh;
+                            if constexpr (!Varlen) {
+                                bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                            } else {
+                                bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                            }
+                            mLSEscratch(m_idx, bidh) = lse_sum(m);
+                        }
                     }
                 }
             }
@@ -686,24 +751,269 @@ public:
             }
         }
 
-        // Step 7: Write the final O to gmem
-        Tensor rO = make_tensor_like<Element>(tOrO);
-        flash::convert_type_out(tOrO, rO);
-        auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
-        Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
-                                shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
-        Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});
-        GmemTiledCopy gmem_tiled_copy_O;
-        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+        // Step 7: Write O to gmem
+        if (params.num_split_groups <= 0) {
+            // Original path: convert to output type and write final O
+            Tensor rO = make_tensor_like<Element>(tOrO);
+            flash::convert_type_out(tOrO, rO);
+            auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
+            Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
+                                    shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
+            Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});
+            GmemTiledCopy gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tOcO); ++m) {
+                if (tObidh(m) >= 0)  {
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(tOcO); ++k) {
+                        int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                        if (Is_even_K || tOpO(k)) {
+                            cute::copy(gmem_tiled_copy_O, rO(_, m, k), mO_copy(_, tOmidx(m), k_idx, tObidh(m)));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Split-group path: write float O to scratch, then atomic + last-CTA epilogue
+            // Scratch O layout mirrors oaccum per group: (batch, head, seqlen, dv) contiguous
+            float* scratch_o_base = params.oaccum_scratch_ptr + split_group_idx * params.scratch_oaccum_group_stride;
+            // Write tOrO (float) to scratch using simple stores
+            #pragma unroll
+            for (int m = 0; m < size<1>(tOcO); ++m) {
+                if (tObidh(m) >= 0) {
+                    float* row_ptr = scratch_o_base
+                        + (!Varlen ? batch : 0) * get<4>(params.stride_O_partial)
+                        + tObidh(m) * get<3>(params.stride_O_partial)
+                        + (offset + tOmidx(m)) * get<0>(params.stride_O_partial)
+                        + k_block * kBlockK;
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(tOcO); ++k) {
+                        if (Is_even_K || tOpO(k)) {
+                            int k_base = get<1>(tOcO(_0{}, _0{}, k));
+                            #pragma unroll
+                            for (int i = 0; i < size<0>(tOrO); ++i) {
+                                int k_off = k_base + i;  // Assumes contiguous in k within each vector
+                                if (k_off < get<1>(params.shape_O_partial) - k_block * kBlockK) {
+                                    row_ptr[k_off] = tOrO(i, m, k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-        #pragma unroll
-        for (int m = 0; m < size<1>(tOcO); ++m) {
-            if (tObidh(m) >= 0)  {
+            // Ensure all writes to scratch are visible before atomic
+            __threadfence();
+            __syncthreads();
+
+            // Atomic: signal this group is done for this tile
+            // Semaphore index = m_block * num_k_blocks * b + k_block * b + bidb
+            // (but we use a simpler flat index since grid is small)
+            int num_k_blocks = cute::ceil_div(int(get<1>(params.shape_O_partial)), int(get<1>(TileShape_MK{})));
+            int sem_idx = (m_block * num_k_blocks + k_block) * params.b + maybe_virtual_batch;
+            int finished_groups = 0;
+            if (threadIdx.x == 0) {
+                finished_groups = atomicAdd(&params.combine_semaphore[sem_idx], 1);
+            }
+            // Broadcast to all threads
+            finished_groups = __shfl_sync(0xffffffff, finished_groups, 0);
+            // Only warp 0 has the value; broadcast to all warps via smem
+            if (threadIdx.x == 0) {
+                sMaxValidSplit[0] = finished_groups;
+            }
+            __syncthreads();
+            finished_groups = sMaxValidSplit[0];
+
+            // If we're not the last group, we're done
+            if (finished_groups < params.num_split_groups - 1) { return; }
+
+            // === Last CTA epilogue: combine group partials from scratch ===
+            // This is essentially the same combine logic but over num_split_groups "splits"
+            // reading from scratch buffers instead of oaccum
+
+            // Step E1: Load group LSEs from scratch into smem
+            // scratch LSE layout: (num_split_groups, seqlen, head, batch)
+            // We reuse sLSE which has shape (kMaxSplits, kBlockM)
+            #pragma unroll
+            for (int m = 0; m < size<2>(tLSEcLSE); ++m) {
+                int mi = int(get<1>(tLSEcLSE(_0{}, _0{}, m)));
+                int idx = m_block * kBlockM + mi;
+                if (idx < max_idx) {
+                    int m_idx, bidh;
+                    if constexpr (!Varlen) {
+                        bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                    } else {
+                        bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                    }
+                    #pragma unroll
+                    for (int s = 0; s < size<1>(tLSEcLSE); ++s) {
+                        int si = get<0>(tLSEcLSE(_0{}, s, _0{}));
+                        if (si < params.num_split_groups) {
+                            // Read from scratch LSE
+                            float* grp_lse = params.lseaccum_scratch_ptr + si * params.scratch_lseaccum_group_stride;
+                            auto shape_LSE_grp = select<0, 2, 3>(params.shape_LSE_partial);
+                            Tensor mLSEgrp = make_tensor(make_gmem_ptr(grp_lse + offset * get<0>(params.stride_LSE)), shape_LSE_grp, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+                            // Direct scalar store to smem (can't use tiled copy easily for arbitrary scratch layout)
+                            // Use the smem position for (si, mi)
+                            sLSE(si, mi) = mLSEgrp(m_idx, bidh);
+                        } else {
+                            sLSE(si, mi) = -INFINITY;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+            // Step E2: Load LSE from smem -> rmem and compute final softmax
+            cute::copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE);
+
+            Tensor lse_sum_final = make_tensor<float>(make_shape(size<2>(ts2rrLSE)));
+            #pragma unroll
+            for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
+                float lse_max = ts2rrLSE(_0{}, _0{}, m);
                 #pragma unroll
-                for (int k = 0; k < size<2>(tOcO); ++k) {
-                    int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    if (Is_even_K || tOpO(k)) {
-                        cute::copy(gmem_tiled_copy_O, rO(_, m, k), mO_copy(_, tOmidx(m), k_idx, tObidh(m)));
+                for (int s = 1; s < size<1>(ts2rrLSE); ++s) { lse_max = max(lse_max, ts2rrLSE(_0{}, s, m)); }
+                MaxOp<float> max_op;
+                lse_max = Allreduce<kSmemThreadsPerColLSEt>::run(lse_max, max_op);
+                float lse_max_cur = lse_max == -INFINITY ? 0.0f : lse_max;
+                float lse_sum_cur = 0.f;
+                #pragma unroll
+                for (int s = 0; s < size<1>(ts2rrLSE); ++s) {
+                    float scale_val = expf(ts2rrLSE(_0{}, s, m) - lse_max_cur);
+                    lse_sum_cur += scale_val;
+                    ts2rrLSE(_0{}, s, m) = scale_val;
+                }
+                SumOp<float> sum_op;
+                lse_sum_cur = Allreduce<kSmemThreadsPerColLSEt>::run(lse_sum_cur, sum_op);
+                lse_sum_final(m) = logf(lse_sum_cur) + lse_max;
+                float inv_sum = (lse_sum_cur == 0.f || lse_sum_cur != lse_sum_cur) ? 0.f : 1.f / lse_sum_cur;
+                #pragma unroll
+                for (int s = 0; s < size<1>(ts2rrLSE); ++s) { ts2rrLSE(_0{}, s, m) *= inv_sum; }
+            }
+            cute::copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE);
+
+            // Step E3: Write final LSE
+            if (k_block == 0) {
+                auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
+                Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+                #pragma unroll
+                for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
+                    if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {
+                        int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
+                        int idx = m_block * kBlockM + mi;
+                        if (idx < max_idx) {
+                            int m_idx, bidh;
+                            if constexpr (!Varlen) {
+                                bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                            } else {
+                                bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                            }
+                            mLSE(m_idx, bidh) = lse_sum_final(m);
+                        }
+                    }
+                }
+            }
+
+            // Step E4: Load group O partials from scratch, accumulate, write final O
+            __syncthreads();
+            // Find max valid group
+            int max_valid_group = params.num_split_groups - 1;
+            // Reuse sMaxValidSplit
+            if (threadIdx.x == 0) {
+                for (int mi = 0; mi < kBlockM; ++mi) { sMaxValidSplit[mi] = max_valid_group; }
+            }
+            __syncthreads();
+
+            Tensor tOrO_final = make_fragment_like<float>(tOrOpartial);
+            clear(tOrO_final);
+
+            // Load group O partials from scratch and accumulate
+            // Scratch O: (seqlen, d, num_split_groups, head, batch) — same layout as oaccum but group dim instead of split dim
+            auto load_O_scratch = [&] (int group, int stage) {
+                Tensor tOsOpartial_cur = tOsOpartial(_, _, _, stage);
+                #pragma unroll
+                for (int m = 0; m < size<1>(tOcO); ++m) {
+                    if (tObidh(m) >= 0) {
+                        // Scratch layout: (seqlen, d, num_split_groups, head, batch) with group_stride in dim 2
+                        ElementPartial const* scratch_o_ep = reinterpret_cast<ElementPartial const*>(params.oaccum_scratch_ptr);
+                        auto shape_scratch = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial),
+                                                        params.num_split_groups, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
+                        auto stride_scratch = make_stride(get<0>(params.stride_O_partial), _1{},
+                                                          params.scratch_oaccum_group_stride, get<3>(params.stride_O_partial), get<4>(params.stride_O_partial));
+                        Tensor mOgrp = make_tensor(make_gmem_ptr(scratch_o_ep + offset * get<0>(params.stride_O_partial)),
+                                                   shape_scratch, stride_scratch)(_, _, _, _, !Varlen ? batch : 0);
+                        Tensor mOgrp_cur = make_tensor(make_gmem_ptr(&mOgrp(tOmidx(m), k_block * kBlockK, _0{}, tObidh(m))),
+                                                       mOgrp(_0{}, _, _, _0{}).layout());
+                        Tensor mOgrp_cur_copy = cute::tiled_divide(mOgrp_cur, Shape<Int<kGmemElemsPerLoad>>{});
+                        #pragma unroll
+                        for (int k = 0; k < size<2>(tOcO); ++k) {
+                            int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                            if (Is_even_K || tOpO(k)) {
+                                cute::copy(gmem_tiled_copy_O_partial, mOgrp_cur_copy(_, k_idx, group), tOsOpartial_cur(_, m, k));
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Pipeline: preload first kStages-1 groups
+            stage_load = kStages - 1;
+            stage_compute = 0;
+            for (int g = 0; g < kStages - 1; ++g) {
+                if (g < params.num_split_groups) { load_O_scratch(g, g); }
+                if constexpr (Has_cp_async) { cute::cp_async_fence(); }
+            }
+
+            for (int g = 0; g < params.num_split_groups; ++g) {
+                Tensor scale_g = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
+                #pragma unroll
+                for (int m = 0; m < size<1>(tOrOpartial); ++m) { scale_g(m) = sLSE(g, get<0>(tOcO(_0{}, m, _0{}))); }
+
+                if (g + kStages - 1 < params.num_split_groups) { load_O_scratch(g + kStages - 1, stage_load); }
+                if constexpr (Has_cp_async) { cute::cp_async_fence(); }
+                stage_load = stage_load < kStages - 1 ? stage_load + 1 : 0;
+                if constexpr (Has_cp_async) { cutlass::arch::cp_async_wait<kStages - 1>(); }
+                cute::copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementPartial>{},
+                           tOsOpartial(_, _, _, stage_compute), tOrOpartial);
+                stage_compute = stage_compute < kStages - 1 ? stage_compute + 1 : 0;
+
+                #pragma unroll
+                for (int m = 0; m < size<1>(tOrOpartial); ++m) {
+                    if (tObidh(m) >= 0 && scale_g(m) > 0.f) {
+                        #pragma unroll
+                        for (int k = 0; k < size<2>(tOrOpartial); ++k) {
+                            if (Is_even_K || tOpO(k)) {
+                                Tensor rOp = make_tensor_like<float>(tOrOpartial(_, m, k));
+                                flash::convert_type_out(tOrOpartial(_, m, k), rOp);
+                                #pragma unroll
+                                for (int i = 0; i < size<0>(tOrOpartial); ++i) {
+                                    tOrO_final(i, m, k) += scale_g(m) * rOp[i];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step E5: Write final O in output type
+            Tensor rO_final = make_tensor_like<Element>(tOrO_final);
+            flash::convert_type_out(tOrO_final, rO_final);
+            auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
+            Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
+                                    shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
+            Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});
+            GmemTiledCopy gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tOcO); ++m) {
+                if (tObidh(m) >= 0) {
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(tOcO); ++k) {
+                        int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                        if (Is_even_K || tOpO(k)) {
+                            cute::copy(gmem_tiled_copy_O, rO_final(_, m, k), mO_copy(_, tOmidx(m), k_idx, tObidh(m)));
+                        }
                     }
                 }
             }

@@ -150,6 +150,15 @@ struct Flash_fwd_params : public Qkv_params {
     int num_splits;  // For split-KV version
     bool pack_gqa;
 
+    // Two-phase split-group combine: tile splits across CTAs
+    int num_split_groups = 0;           // 0 = disabled, >1 = number of split groups
+    int splits_per_group = 0;
+    float * __restrict__ oaccum_scratch_ptr = nullptr;   // (num_split_groups, seqlen, d, head, batch)
+    float * __restrict__ lseaccum_scratch_ptr = nullptr;  // (num_split_groups, seqlen, head, batch)
+    int64_t scratch_oaccum_group_stride = 0;
+    int64_t scratch_lseaccum_group_stride = 0;
+    int * __restrict__ combine_semaphore = nullptr;       // (num_m_blocks * num_k_blocks * batch)
+
     int * __restrict__ tile_count_semaphore;
     // int * __restrict__ num_m_blocks_ptr;
     int * __restrict__ prepare_seqlen_q_ptr;

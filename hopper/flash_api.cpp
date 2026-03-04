@@ -407,6 +407,59 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
+
+    // Split-group combine: when num_splits is large and CTA count is low,
+    // tile the split dimension across CTAs for better parallelism.
+    int const kBlockK = params.dv <= 64 ? 64 : 128;
+    int const kBlockM = kBlockK % 128 == 0 ? 8 : (kBlockK % 64 == 0 ? 16 : 32);
+    int seqlen = params.cu_seqlens_q ? params.total_q : params.seqlen_q;
+    int num_m_blocks = (seqlen * params.h + kBlockM - 1) / kBlockM;
+    int num_k_blocks = (params.dv + kBlockK - 1) / kBlockK;
+    int num_ctas = num_m_blocks * num_k_blocks * params.b;
+    int const kMinSplitsForSplitGroup = 96;
+    int const kMaxCTAsForSplitGroup = 16;  // Only use split-group when parallelism is very low
+
+    if (params.num_splits >= kMinSplitsForSplitGroup && num_ctas <= kMaxCTAsForSplitGroup
+        && !params.num_splits_dynamic_ptr && !params.cu_seqlens_q
+        && params.dv > 64) {
+        // Choose num_split_groups: target enough total CTAs for good occupancy
+        // but not so many that the epilogue reduction becomes expensive
+        int target_groups = std::max(2, 132 / std::max(1, num_ctas));
+        // Cap at 16 groups — the epilogue's last CTA must combine all groups sequentially
+        target_groups = std::min(target_groups, 16);
+        // Round down to power of 2 for clean division
+        int ng = 1;
+        while (ng * 2 <= target_groups && ng * 2 <= params.num_splits) ng *= 2;
+        // Ensure splits_per_group doesn't exceed kMaxSplits for the chosen template
+        // kMaxSplits is determined by kLogMaxSplits which is chosen based on num_splits
+        // For the group CTAs, they see splits_per_group splits, so we need splits_per_group <= kMaxSplits
+        int splits_per_group = (params.num_splits + ng - 1) / ng;
+        // Also ensure num_split_groups <= kMaxSplits (for the epilogue reduction)
+        if (ng > 128) ng = 128;  // kMaxSplits max is 256 (kLogMaxSplits=8)
+
+        if (ng > 1) {
+            splits_per_group = (params.num_splits + ng - 1) / ng;
+
+            // Allocate scratch buffers
+            auto opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+            at::Tensor o_scratch = torch::empty({ng, params.b, params.h, seqlen, params.dv}, opts);
+            at::Tensor lse_scratch = torch::empty({ng, params.b, params.h, seqlen}, opts);
+            // Semaphore: one int per (m_block, k_block, batch) tile, must be zeroed
+            int sem_size = num_m_blocks * num_k_blocks * params.b;
+            at::Tensor semaphore = torch::empty({sem_size}, opts.dtype(at::kInt));
+            cudaMemsetAsync(semaphore.data_ptr(), 0, sem_size * sizeof(int), stream);
+
+            params.num_split_groups = ng;
+            params.splits_per_group = splits_per_group;
+            params.oaccum_scratch_ptr = o_scratch.data_ptr<float>();
+            params.lseaccum_scratch_ptr = lse_scratch.data_ptr<float>();
+            // Group stride: distance between consecutive groups in the scratch buffer
+            params.scratch_oaccum_group_stride = o_scratch.stride(0);
+            params.scratch_lseaccum_group_stride = lse_scratch.stride(0);
+            params.combine_semaphore = semaphore.data_ptr<int>();
+        }
+    }
+
     if (params.is_fp32) {
         if (params.dv <= 64) {
             run_mha_fwd_combine_<float, float, 64>(params, stream, enable_pdl);

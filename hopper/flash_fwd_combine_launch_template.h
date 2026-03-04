@@ -36,12 +36,16 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
         static_cast<float*>(params.softmax_lse_ptr),
         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
-        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore
+        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore,
+        params.num_split_groups, params.splits_per_group,
+        params.oaccum_scratch_ptr, params.lseaccum_scratch_ptr,
+        params.scratch_oaccum_group_stride, params.scratch_lseaccum_group_stride,
+        params.combine_semaphore
     };
 
     typename CombineKernel::SchedulerArguments scheduler_args  {
         params.b, params.seqlen_q, params.total_q, params.h, params.h_k, params.dv, params.pack_gqa,
-        params.cu_seqlens_q, params.seqused_q, params.prepare_seqlen_q_ptr
+        params.cu_seqlens_q, params.seqused_q, params.prepare_seqlen_q_ptr, params.num_split_groups
     };
 
     typename CombineKernel::Params kernel_params = {
